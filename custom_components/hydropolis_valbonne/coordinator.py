@@ -30,6 +30,9 @@ _LOGGER = logging.getLogger(__name__)
 
 FALLBACK_HISTORY_DAYS = 365 * 4
 
+# Key in hass.data under which shared clients are stored: DOMAIN -> {username -> HydropolisClient}
+SHARED_CLIENTS_KEY = f"{DOMAIN}_shared_clients"
+
 
 @dataclass
 class HydropolisData:
@@ -54,6 +57,10 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
     don't conflict with HA's auto-generated statistics from entity state
     changes.  The sensor entity intentionally has no state_class for the
     same reason.
+
+    When multiple config entries share the same Hydropolis account (username),
+    they reuse a single HydropolisClient so that re-authentication by one entry
+    does not invalidate the Omega SSO session of the other.
     """
 
     _client: HydropolisClient
@@ -77,14 +84,28 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
         return f"{DOMAIN}:{self._contrat_id}_water_meter"
 
     async def _async_setup(self) -> None:
-        session = async_get_clientsession(self.hass)
-        self._client = HydropolisClient(
-            session,
-            self.config_entry.data[CONF_USERNAME],
-            self.config_entry.data[CONF_PASSWORD],
-        )
-        if not await self._client.authenticate():
-            raise ConfigEntryError("Invalid credentials for Hydropolis")
+        username: str = self.config_entry.data[CONF_USERNAME]
+        password: str = self.config_entry.data[CONF_PASSWORD]
+
+        # Shared client registry: one HydropolisClient per username across all entries.
+        # This ensures that two contracts from the same account never call authenticate()
+        # concurrently, which would cause the Omega SSO to invalidate the first session.
+        if SHARED_CLIENTS_KEY not in self.hass.data:
+            self.hass.data[SHARED_CLIENTS_KEY] = {}
+
+        shared_clients: dict[str, HydropolisClient] = self.hass.data[SHARED_CLIENTS_KEY]
+
+        if username not in shared_clients:
+            _LOGGER.debug("Creating new shared HydropolisClient for user %s", username)
+            session = async_get_clientsession(self.hass)
+            client = HydropolisClient(session, username, password)
+            if not await client.authenticate():
+                raise ConfigEntryError("Invalid credentials for Hydropolis")
+            shared_clients[username] = client
+        else:
+            _LOGGER.debug("Reusing existing shared HydropolisClient for user %s", username)
+
+        self._client = shared_clients[username]
 
     async def _async_update_data(self) -> HydropolisData | None:
         """Incremental fetch: get data from last known stat to today.
@@ -107,7 +128,7 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
                 "Incremental fetch from %s (last stat: %s)", start, last_recorded
             )
         else:
-            start = self._client.data_available_since
+            start = self._client.data_available_since_for(self._contrat_id)
             if start is None:
                 start = today - timedelta(days=FALLBACK_HISTORY_DAYS)
             _LOGGER.info("First fetch — pulling history from %s", start)
