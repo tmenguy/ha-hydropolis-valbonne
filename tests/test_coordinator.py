@@ -291,7 +291,10 @@ async def test_meter_swap_does_not_produce_negative_sum(
         )
 
     assert sums == [2_500_000.0, 2_500_000.0, 2_500_150.0]
-    assert states == [2_500_000.0, 200.0, 350.0]
+    # state mirrors the corrected cumulative sum so HA's History graph
+    # stays monotonic too — the raw meter reading remains accessible
+    # via the sensor entity's native_value.
+    assert states == sums
 
 
 async def test_incremental_sum_continues_from_last_recorded(

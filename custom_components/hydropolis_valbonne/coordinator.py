@@ -213,7 +213,7 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             statistics.append(
                 StatisticData(
                     start=dt_util.start_of_local_day(measure.date),
-                    state=float(measure.meter_index),
+                    state=running_sum,
                     sum=running_sum,
                 )
             )
