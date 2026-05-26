@@ -115,7 +115,7 @@ def mock_hydropolis_client(fake_measures, fake_contract):
     client.authenticate = AsyncMock(return_value=True)
     client.get_contracts = AsyncMock(return_value=[fake_contract])
     client.get_daily_measures = AsyncMock(return_value=fake_measures)
-    client.data_available_since = date.today() - timedelta(days=365)
+    client.data_available_since_for.return_value = date.today() - timedelta(days=365)
     client.invalidate_tokens = lambda: None
 
     with patch(

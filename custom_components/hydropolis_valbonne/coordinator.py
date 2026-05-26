@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
 
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import (
-#    StatisticMeanType,
+    StatisticMeanType,
     StatisticsRow,
     async_add_external_statistics,
     async_import_statistics,
@@ -21,6 +22,7 @@ from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 import homeassistant.util.dt as dt_util
+from homeassistant.util.unit_conversion import VolumeConverter
 
 from .api import DailyMeasure, HydropolisApiError, HydropolisAuthError, HydropolisClient
 from .const import CONF_CONTRAT_ID, DATA_REFRESH_INTERVAL, DOMAIN
@@ -29,8 +31,11 @@ _LOGGER = logging.getLogger(__name__)
 
 FALLBACK_HISTORY_DAYS = 365 * 4
 
-# Key in hass.data under which shared clients are stored: DOMAIN -> {username -> HydropolisClient}
+# Key in hass.data under which shared clients are stored: {username -> HydropolisClient}.
+# A sibling lock under SHARED_CLIENTS_LOCK_KEY serializes setup so two concurrent
+# entries for the same username can't both create a fresh client and double-authenticate.
 SHARED_CLIENTS_KEY = f"{DOMAIN}_shared_clients"
+SHARED_CLIENTS_LOCK_KEY = f"{DOMAIN}_shared_clients_lock"
 
 
 @dataclass
@@ -89,22 +94,25 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
         # Shared client registry: one HydropolisClient per username across all entries.
         # This ensures that two contracts from the same account never call authenticate()
         # concurrently, which would cause the Omega SSO to invalidate the first session.
-        if SHARED_CLIENTS_KEY not in self.hass.data:
-            self.hass.data[SHARED_CLIENTS_KEY] = {}
+        shared_clients: dict[str, HydropolisClient] = self.hass.data.setdefault(
+            SHARED_CLIENTS_KEY, {}
+        )
+        lock: asyncio.Lock = self.hass.data.setdefault(
+            SHARED_CLIENTS_LOCK_KEY, asyncio.Lock()
+        )
 
-        shared_clients: dict[str, HydropolisClient] = self.hass.data[SHARED_CLIENTS_KEY]
+        async with lock:
+            if username not in shared_clients:
+                _LOGGER.debug("Creating new shared HydropolisClient for user %s", username)
+                session = async_get_clientsession(self.hass)
+                client = HydropolisClient(session, username, password)
+                if not await client.authenticate():
+                    raise ConfigEntryError("Invalid credentials for Hydropolis")
+                shared_clients[username] = client
+            else:
+                _LOGGER.debug("Reusing existing shared HydropolisClient for user %s", username)
 
-        if username not in shared_clients:
-            _LOGGER.debug("Creating new shared HydropolisClient for user %s", username)
-            session = async_get_clientsession(self.hass)
-            client = HydropolisClient(session, username, password)
-            if not await client.authenticate():
-                raise ConfigEntryError("Invalid credentials for Hydropolis")
-            shared_clients[username] = client
-        else:
-            _LOGGER.debug("Reusing existing shared HydropolisClient for user %s", username)
-
-        self._client = shared_clients[username]
+            self._client = shared_clients[username]
 
     async def _async_update_data(self) -> HydropolisData | None:
         """Incremental fetch: get data from last known stat to today.
@@ -192,12 +200,12 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             return
 
         metadata = StatisticMetaData(
-#            mean_type=StatisticMeanType.NONE,
-            has_mean=False,
+            mean_type=StatisticMeanType.NONE,
             has_sum=True,
             name=f"Hydropolis {self._contrat_id} Water",
             source=DOMAIN,
             statistic_id=self.statistic_id,
+            unit_class=VolumeConverter.UNIT_CLASS,
             unit_of_measurement=UnitOfVolume.LITERS,
         )
 

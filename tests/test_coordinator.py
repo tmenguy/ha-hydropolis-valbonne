@@ -12,17 +12,39 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.hydropolis_valbonne.api import HydropolisApiError
 from custom_components.hydropolis_valbonne.const import DOMAIN
-from custom_components.hydropolis_valbonne.coordinator import HydropolisCoordinator
+from custom_components.hydropolis_valbonne.coordinator import (
+    SHARED_CLIENTS_KEY,
+    HydropolisCoordinator,
+)
 
-from .conftest import FAKE_CONTRAT_ID, _make_measures
+from .conftest import (
+    FAKE_CONTRAT_ID,
+    FAKE_CONTRAT_ID_2,
+    FAKE_EMAIL,
+    _make_measures,
+)
 
 
 async def _setup(hass: HomeAssistant, mock_config_entry):
     """Set up the integration via the HA config entry machinery."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    if mock_config_entry.state is not ConfigEntryState.LOADED:
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
     coordinator: HydropolisCoordinator = mock_config_entry.runtime_data
     return coordinator
+
+
+async def _setup_both(hass: HomeAssistant, entry_a, entry_b):
+    """Set up two config entries and return their coordinators.
+
+    Entries may already be LOADED by the time we get here (HA auto-loads
+    NOT_LOADED entries during pending-task processing), so skip ones that are.
+    """
+    for entry in (entry_a, entry_b):
+        if entry.state is not ConfigEntryState.LOADED:
+            await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry_a.runtime_data, entry_b.runtime_data
 
 
 async def test_first_refresh_fetches_full_history(
@@ -128,8 +150,6 @@ async def test_incremental_refresh(
 # Multi-contract tests
 # ---------------------------------------------------------------------------
 
-from .conftest import FAKE_CONTRAT_ID_2, FAKE_EMAIL
-
 
 async def test_two_contracts_share_single_client(
     hass: HomeAssistant,
@@ -143,28 +163,17 @@ async def test_two_contracts_share_single_client(
     that the second coordinator's login does not invalidate the first
     entry's Omega SSO session.
     """
-    from custom_components.hydropolis_valbonne.coordinator import SHARED_CLIENTS_KEY
-
-    from homeassistant.config_entries import ConfigEntryState
-    if mock_config_entry.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    if mock_config_entry_2.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry_2.entry_id)
-    await hass.async_block_till_done()
-
-    from homeassistant.config_entries import ConfigEntryState
+    coordinator_1, coordinator_2 = await _setup_both(
+        hass, mock_config_entry, mock_config_entry_2
+    )
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
     assert mock_config_entry_2.state is ConfigEntryState.LOADED
 
-    # Only one authenticate() call across both entries
     mock_hydropolis_client.authenticate.assert_called_once()
 
-    # Both entries reference the exact same client object in hass.data
     shared = hass.data.get(SHARED_CLIENTS_KEY, {})
     assert FAKE_EMAIL in shared
-    coordinator_1: HydropolisCoordinator = mock_config_entry.runtime_data
-    coordinator_2: HydropolisCoordinator = mock_config_entry_2.runtime_data
     assert coordinator_1._client is coordinator_2._client
 
 
@@ -177,10 +186,7 @@ async def test_two_contracts_independent_data(
     fake_measures_2,
 ):
     """Each coordinator returns its own data even when sharing a client."""
-    from unittest.mock import AsyncMock
-    from custom_components.hydropolis_valbonne.const import CONF_CONTRAT_ID
 
-    # Return different measures depending on which contrat_id is requested
     async def measures_by_contract(contrat_id, serial, start, end):
         if contrat_id == FAKE_CONTRAT_ID:
             return fake_measures
@@ -190,15 +196,9 @@ async def test_two_contracts_independent_data(
         side_effect=measures_by_contract
     )
 
-    from homeassistant.config_entries import ConfigEntryState
-    if mock_config_entry.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    if mock_config_entry_2.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry_2.entry_id)
-    await hass.async_block_till_done()
-
-    coordinator_1: HydropolisCoordinator = mock_config_entry.runtime_data
-    coordinator_2: HydropolisCoordinator = mock_config_entry_2.runtime_data
+    coordinator_1, coordinator_2 = await _setup_both(
+        hass, mock_config_entry, mock_config_entry_2
+    )
 
     assert coordinator_1.data.meter_total_liters == fake_measures[-1].meter_index
     assert coordinator_2.data.meter_total_liters == fake_measures_2[-1].meter_index
@@ -212,18 +212,32 @@ async def test_second_contract_has_distinct_statistic_id(
     mock_hydropolis_client,
 ):
     """Each contract must have a unique statistic_id for the Energy dashboard."""
-    from custom_components.hydropolis_valbonne.const import DOMAIN
-
-    from homeassistant.config_entries import ConfigEntryState
-    if mock_config_entry.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    if mock_config_entry_2.state is not ConfigEntryState.LOADED:
-        await hass.config_entries.async_setup(mock_config_entry_2.entry_id)
-    await hass.async_block_till_done()
-
-    coordinator_1: HydropolisCoordinator = mock_config_entry.runtime_data
-    coordinator_2: HydropolisCoordinator = mock_config_entry_2.runtime_data
+    coordinator_1, coordinator_2 = await _setup_both(
+        hass, mock_config_entry, mock_config_entry_2
+    )
 
     assert coordinator_1.statistic_id != coordinator_2.statistic_id
     assert coordinator_1.statistic_id == f"{DOMAIN}:{FAKE_CONTRAT_ID}_water_meter"
     assert coordinator_2.statistic_id == f"{DOMAIN}:{FAKE_CONTRAT_ID_2}_water_meter"
+
+
+async def test_shared_client_dropped_when_last_entry_removed(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_config_entry_2,
+    mock_hydropolis_client,
+):
+    """Shared client must persist while any entry for the user remains,
+    and be dropped only when the last entry is removed."""
+    await _setup_both(hass, mock_config_entry, mock_config_entry_2)
+
+    shared = hass.data[SHARED_CLIENTS_KEY]
+    assert FAKE_EMAIL in shared
+
+    await hass.config_entries.async_remove(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert FAKE_EMAIL in shared, "client dropped too early — second entry still uses it"
+
+    await hass.config_entries.async_remove(mock_config_entry_2.entry_id)
+    await hass.async_block_till_done()
+    assert FAKE_EMAIL not in shared, "client should be dropped after last entry removed"

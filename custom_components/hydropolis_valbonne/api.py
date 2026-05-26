@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 import json
 import logging
@@ -344,13 +344,6 @@ class HydropolisClient:
     def data_available_since_for(self, contrat_id: str) -> date | None:
         """Earliest date with data for a given contract, extracted from the 3Int JWT."""
         return self._data_available_since.get(contrat_id)
-
-    @property
-    def data_available_since(self) -> date | None:
-        """Earliest date with data (any contract). Kept for backward compatibility."""
-        if not self._data_available_since:
-            return None
-        return min(self._data_available_since.values())
 
     def invalidate_tokens(self) -> None:
         """Clear cached tokens, forcing re-authentication on next call."""
