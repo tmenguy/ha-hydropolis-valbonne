@@ -103,7 +103,7 @@ async def test_data_available_since(client: HydropolisClient):
     start = end - timedelta(days=1)
     await client.get_daily_measures(c.contrat_id, c.compteur_numserie, start, end)
 
-    since = client.data_available_since
+    since = client.data_available_since_for(c.contrat_id)
     assert since is not None
     assert since < date.today()
 

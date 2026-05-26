@@ -1,5 +1,6 @@
 {
   "name": "Hydropolis Valbonne",
   "render_readme": true,
-  "country": ["FR"]
+  "country": ["FR"],
+  "homeassistant": "2025.4.0"
 }

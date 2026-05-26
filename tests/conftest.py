@@ -60,11 +60,11 @@ def fake_contract() -> HydropolisContract:
     )
 
 
-def _make_measures(count: int = 5, start_date: date | None = None) -> list[DailyMeasure]:
+def _make_measures(count: int = 5, start_date: date | None = None, start_index: int = 100_000) -> list[DailyMeasure]:
     """Build a list of realistic DailyMeasure objects."""
     base = start_date or date.today() - timedelta(days=count)
     measures = []
-    index = 100_000
+    index = start_index
     for i in range(count):
         d = base + timedelta(days=i)
         consumption = 150 + i * 10
@@ -115,7 +115,7 @@ def mock_hydropolis_client(fake_measures, fake_contract):
     client.authenticate = AsyncMock(return_value=True)
     client.get_contracts = AsyncMock(return_value=[fake_contract])
     client.get_daily_measures = AsyncMock(return_value=fake_measures)
-    client.data_available_since = date.today() - timedelta(days=365)
+    client.data_available_since_for.return_value = date.today() - timedelta(days=365)
     client.invalidate_tokens = lambda: None
 
     with patch(
@@ -126,3 +126,48 @@ def mock_hydropolis_client(fake_measures, fake_contract):
         return_value=client,
     ):
         yield client
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for multi-contract tests
+# ---------------------------------------------------------------------------
+
+FAKE_CONTRAT_ID_2 = "8888"
+FAKE_SERIAL_2 = "XYZ987654"
+
+
+@pytest.fixture
+def fake_contract_2() -> HydropolisContract:
+    return HydropolisContract(
+        contrat_id=FAKE_CONTRAT_ID_2,
+        numcontrat="C-8888",
+        pconso_id="P-200",
+        compteur_numserie=FAKE_SERIAL_2,
+        actif=True,
+        address="2 Rue du Test",
+    )
+
+
+@pytest.fixture
+def fake_measures_2() -> list[DailyMeasure]:
+    return _make_measures(count=3, start_date=date.today() - timedelta(days=10))
+
+
+@pytest.fixture
+def mock_config_entry_2(hass: HomeAssistant):
+    """Second config entry — same username, different contract."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hydropolis C-8888",
+        data={
+            CONF_USERNAME: FAKE_EMAIL,
+            CONF_PASSWORD: FAKE_PASSWORD,
+            CONF_CONTRAT_ID: FAKE_CONTRAT_ID_2,
+            "compteur_numserie": FAKE_SERIAL_2,
+        },
+        unique_id=FAKE_CONTRAT_ID_2,
+    )
+    entry.add_to_hass(hass)
+    return entry
