@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-from unittest.mock import AsyncMock
+from datetime import date, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 
-from custom_components.hydropolis_valbonne.api import HydropolisApiError
+from custom_components.hydropolis_valbonne.api import DailyMeasure, HydropolisApiError
 from custom_components.hydropolis_valbonne.const import DOMAIN
 from custom_components.hydropolis_valbonne.coordinator import (
     SHARED_CLIENTS_KEY,
@@ -241,3 +241,91 @@ async def test_shared_client_dropped_when_last_entry_removed(
     await hass.config_entries.async_remove(mock_config_entry_2.entry_id)
     await hass.async_block_till_done()
     assert FAKE_EMAIL not in shared, "client should be dropped after last entry removed"
+
+
+# ---------------------------------------------------------------------------
+# Issue #5: meter swap must not produce negative consumption
+# ---------------------------------------------------------------------------
+
+
+def _measure(d: date, consumption: int, index: int) -> DailyMeasure:
+    return DailyMeasure(
+        date=d,
+        timestamp=datetime(d.year, d.month, d.day, 23, 59, 0),
+        consumption_liters=consumption,
+        meter_index=index,
+    )
+
+
+async def test_meter_swap_does_not_produce_negative_sum(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """When the physical meter is replaced, meter_index drops from a large
+    value to a small one and the API reports a hugely negative consumption
+    for that day. The cumulative sum recorded in statistics must NOT drop
+    — the meter-swap day adds 0 to the sum (issue #5)."""
+    d0 = date.today() - timedelta(days=3)
+    swap_measures = [
+        _measure(d0, consumption=200, index=2_500_000),
+        _measure(d0 + timedelta(days=1), consumption=-2_499_800, index=200),
+        _measure(d0 + timedelta(days=2), consumption=150, index=350),
+    ]
+    mock_hydropolis_client.get_daily_measures = AsyncMock(return_value=swap_measures)
+
+    with patch(
+        "custom_components.hydropolis_valbonne.coordinator.async_add_external_statistics"
+    ) as mock_add_stats:
+        await _setup(hass, mock_config_entry)
+
+    assert mock_add_stats.called, "statistics should have been imported"
+    _, _, stats = mock_add_stats.call_args[0]
+
+    sums = [s["sum"] for s in stats]
+    states = [s["state"] for s in stats]
+
+    for i in range(1, len(sums)):
+        assert sums[i] >= sums[i - 1], (
+            f"sum dropped at index {i}: {sums[i]} < {sums[i - 1]}"
+        )
+
+    assert sums == [2_500_000.0, 2_500_000.0, 2_500_150.0]
+    assert states == [2_500_000.0, 200.0, 350.0]
+
+
+async def test_incremental_sum_continues_from_last_recorded(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """On an incremental refresh, the running sum must continue from the
+    previously recorded statistic — not restart from the new measure's
+    meter_index. This is what makes the meter-swap fix work across
+    coordinator restarts."""
+    d0 = date.today() - timedelta(days=2)
+    first_batch = [_measure(d0, consumption=200, index=2_500_000)]
+    mock_hydropolis_client.get_daily_measures = AsyncMock(return_value=first_batch)
+
+    await _setup(hass, mock_config_entry)
+
+    second_batch = [
+        _measure(d0 + timedelta(days=1), consumption=-2_499_800, index=200),
+        _measure(d0 + timedelta(days=2), consumption=150, index=350),
+    ]
+    coordinator: HydropolisCoordinator = mock_config_entry.runtime_data
+    mock_hydropolis_client.get_daily_measures = AsyncMock(return_value=second_batch)
+
+    with patch(
+        "custom_components.hydropolis_valbonne.coordinator.async_add_external_statistics"
+    ) as mock_add_stats:
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+    _, _, stats = mock_add_stats.call_args[0]
+    sums = [s["sum"] for s in stats]
+
+    assert sums == [2_500_000.0, 2_500_150.0], (
+        "incremental fetch must seed from last recorded sum (2_500_000), "
+        f"clip the negative day, then add 150 — got {sums}"
+    )

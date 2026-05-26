@@ -162,7 +162,7 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             _LOGGER.info("No measures available from Hydropolis API yet")
             return None
 
-        self._import_statistics(measures)
+        self._import_statistics(measures, last_stat)
 
         latest = measures[-1]
         _LOGGER.debug(
@@ -177,22 +177,44 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             last_measurement=latest.timestamp,
         )
 
-    def _import_statistics(self, measures: list[DailyMeasure]) -> None:
+    def _import_statistics(
+        self,
+        measures: list[DailyMeasure],
+        last_stat: StatisticsRow | None,
+    ) -> None:
         """Push fetched daily measures into HA long-term statistics.
 
         Uses an external source (DOMAIN, not "recorder") so the entries
         are independent of any auto-generated statistics from entity state
         changes.  The Energy dashboard can pick them up by statistic_id.
+
+        The cumulative `sum` is tracked independently of `meter_index` so that
+        a physical meter swap (which drops meter_index from e.g. 2,500,000 → 50
+        and makes the API report a hugely negative daily consumption) does not
+        produce a giant negative spike on the Energy dashboard. Negative-
+        consumption days are clipped to 0 — see issue #5.
         """
+        # Seed the running sum from the last recorded statistic so incremental
+        # fetches continue smoothly. On a true first import there's nothing to
+        # build on, so seed from the first measure's meter_index — this matches
+        # the historical sum=meter_index behavior on day one and keeps existing
+        # dashboards continuous.
+        running_sum: float | None = (
+            float(last_stat["sum"]) if last_stat is not None else None
+        )
+
         statistics: list[StatisticData] = []
         for measure in measures:
-            if measure.consumption_liters < 0:
-                continue
+            if running_sum is None:
+                running_sum = float(measure.meter_index)
+            else:
+                running_sum += max(0, measure.consumption_liters)
+
             statistics.append(
                 StatisticData(
                     start=dt_util.start_of_local_day(measure.date),
                     state=float(measure.meter_index),
-                    sum=float(measure.meter_index),
+                    sum=running_sum,
                 )
             )
 
