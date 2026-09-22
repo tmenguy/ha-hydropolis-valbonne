@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connexion Hydropolis",
+        "description": "Saisissez les identifiants de votre espace abonné Hydropolis.",
+        "data": {
+          "username": "Adresse e-mail",
+          "password": "Mot de passe"
+        }
+      },
+      "select_contract": {
+        "title": "Choix du contrat",
+        "description": "Plusieurs contrats ont été trouvés. Sélectionnez celui à suivre.",
+        "data": {
+          "contrat_id": "Contrat"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Échec de l'authentification Hydropolis",
+        "description": "Hydropolis a refusé les identifiants enregistrés pour **{username}**. Saisissez l'e-mail et le mot de passe actuels de votre espace abonné pour reconnecter **{contract}**.",
+        "data": {
+          "username": "Adresse e-mail",
+          "password": "Mot de passe"
+        }
+      },
+      "reconfigure": {
+        "title": "Identifiants Hydropolis",
+        "description": "Mettez à jour les identifiants de l'espace abonné utilisés pour **{contract}**. Le contrat suivi reste le même, l'historique enregistré est donc conservé.",
+        "data": {
+          "username": "Adresse e-mail",
+          "password": "Mot de passe"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "E-mail ou mot de passe incorrect.",
+      "cannot_connect": "Impossible de joindre Hydropolis. Réessayez plus tard.",
+      "no_contracts": "Aucun contrat d'eau trouvé pour ce compte.",
+      "contract_not_found": "Ce compte ne contient pas le contrat configuré pour cette entrée. Utilisez le compte qui le détient, ou supprimez cette entrée et ajoutez l'autre contrat.",
+      "unknown": "Une erreur inattendue s'est produite."
+    },
+    "abort": {
+      "already_configured": "Ce contrat est déjà configuré.",
+      "reauth_successful": "Hydropolis a été reconnecté avec succès.",
+      "reconfigure_successful": "Les identifiants Hydropolis ont été mis à jour."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "water_meter": {
+        "name": "Compteur d'eau"
+      }
+    }
+  }
+}

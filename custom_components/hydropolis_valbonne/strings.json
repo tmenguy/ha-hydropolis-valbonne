@@ -15,16 +15,35 @@
         "data": {
           "contrat_id": "Contract"
         }
+      },
+      "reauth_confirm": {
+        "title": "Hydropolis authentication failed",
+        "description": "Hydropolis rejected the stored credentials for **{username}**. Enter the current email and password of your subscriber portal account to reconnect **{contract}**.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Hydropolis credentials",
+        "description": "Update the subscriber portal credentials used for **{contract}**. The monitored contract itself is unchanged, so the recorded history is preserved.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid email or password.",
       "cannot_connect": "Unable to connect to Hydropolis. Please try again later.",
       "no_contracts": "No water contracts found for this account.",
+      "contract_not_found": "This account does not contain the contract configured for this entry. Use the account that owns it, or remove this entry and add the other one.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
-      "already_configured": "This contract is already configured."
+      "already_configured": "This contract is already configured.",
+      "reauth_successful": "Hydropolis was reconnected successfully.",
+      "reconfigure_successful": "The Hydropolis credentials were updated."
     }
   },
   "entity": {

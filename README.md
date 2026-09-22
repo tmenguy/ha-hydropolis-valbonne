@@ -46,6 +46,12 @@ The integration is configured entirely through the UI.
 
 On first setup, the integration pulls all available history (up to several years) from the Hydropolis API. This may take a moment depending on the amount of data.
 
+### Changing your credentials
+
+If you change your password on the Hydropolis portal, Home Assistant shows a **Reconfigure** notification and asks for the new one. You can also update them at any time from **Settings > Devices & Services > Hydropolis Valbonne > ⋮ > Reconfigure**, without deleting the integration — the monitored contract and its recorded history are preserved.
+
+When several contracts of the same account are configured, updating the credentials on one of them updates all the others too.
+
 ## Energy Dashboard -- Water Consumption
 
 This integration is designed to work with Home Assistant's [Energy dashboard](https://www.home-assistant.io/docs/energy/). To add your water consumption:
@@ -113,7 +119,8 @@ logger:
 
 | Problem | Cause / Solution |
 |---|---|
-| "Invalid email or password" | Double-check your Hydropolis portal credentials at [hydropolis-sophia.fr](https://www.hydropolis-sophia.fr/) |
+| "Invalid email or password" | Double-check your Hydropolis portal credentials at [hydropolis-sophia.fr](https://www.hydropolis-sophia.fr/), then fix them via **Reconfigure** (see [Changing your credentials](#changing-your-credentials)) |
+| Integration fails to load, then retries | The Hydropolis backend intermittently returns HTTP 500, even to valid credentials. Home Assistant retries on its own with a growing delay — no action needed |
 | "No water contracts found" | Your account may not have an active contract, or the Hydropolis API may be temporarily unavailable |
 | No data in Energy dashboard | Data takes a few days to appear initially. Make sure you selected the *statistic* (not the entity) in the Energy dashboard configuration |
 | Values seem outdated | This is expected -- see [Data is delayed](#data-is-delayed----this-is-normal) above |

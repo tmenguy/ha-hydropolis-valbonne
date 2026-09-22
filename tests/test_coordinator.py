@@ -8,9 +8,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 
-from custom_components.hydropolis_valbonne.api import HydropolisApiError
+from custom_components.hydropolis_valbonne.api import (
+    HydropolisApiError,
+    HydropolisAuthError,
+)
 from custom_components.hydropolis_valbonne.const import DOMAIN
 from custom_components.hydropolis_valbonne.coordinator import (
     SHARED_CLIENTS_KEY,
@@ -21,6 +25,7 @@ from .conftest import (
     FAKE_CONTRAT_ID,
     FAKE_CONTRAT_ID_2,
     FAKE_EMAIL,
+    FAKE_PASSWORD,
     _make_measures,
 )
 
@@ -241,3 +246,104 @@ async def test_shared_client_dropped_when_last_entry_removed(
     await hass.config_entries.async_remove(mock_config_entry_2.entry_id)
     await hass.async_block_till_done()
     assert FAKE_EMAIL not in shared, "client should be dropped after last entry removed"
+
+
+# ---------------------------------------------------------------------------
+# Authentication failures at setup
+# ---------------------------------------------------------------------------
+
+
+async def test_transient_api_error_retries_setup(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """A 5xx from the SSO must schedule a retry, not fail the entry for good.
+
+    The Hydropolis SSO intermittently answers 500 to valid credentials; the
+    entry has to come back on its own once the backend recovers.
+    """
+    mock_hydropolis_client.authenticate = AsyncMock(
+        side_effect=HydropolisApiError("SSO login returned 500")
+    )
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+
+
+async def test_rejected_credentials_start_reauth_flow(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """Rejected credentials must offer the user a reauth flow."""
+    mock_hydropolis_client.authenticate = AsyncMock(return_value=False)
+    mock_hydropolis_client.last_auth_error = "Le mot de passe est incorrect !"
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.SETUP_ERROR
+
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+
+
+async def test_failed_setup_does_not_cache_client(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """A client that failed to authenticate must not be reused later."""
+    mock_hydropolis_client.authenticate = AsyncMock(return_value=False)
+
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.data.get(SHARED_CLIENTS_KEY, {}) == {}
+
+
+async def test_new_password_replaces_cached_client(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """Changing the password must not keep using the stale shared client."""
+    mock_hydropolis_client.credentials_match = (
+        lambda username, password: password == FAKE_PASSWORD
+    )
+
+    await _setup(hass, mock_config_entry)
+    assert mock_hydropolis_client.authenticate.call_count == 1
+
+    hass.config_entries.async_update_entry(
+        mock_config_entry,
+        data={**mock_config_entry.data, CONF_PASSWORD: "new-password"},
+    )
+    await hass.config_entries.async_reload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    assert mock_hydropolis_client.authenticate.call_count == 2
+
+
+async def test_auth_error_during_refresh_starts_reauth_flow(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """Credentials going stale later also triggers a reauth flow."""
+    coordinator = await _setup(hass, mock_config_entry)
+
+    mock_hydropolis_client.get_daily_measures = AsyncMock(
+        side_effect=HydropolisAuthError("Failed to authenticate with Omega SSO")
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success is False
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [flow["context"]["source"] for flow in flows] == ["reauth"]

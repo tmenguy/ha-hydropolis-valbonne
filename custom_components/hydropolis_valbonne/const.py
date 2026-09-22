@@ -5,6 +5,7 @@ from datetime import timedelta
 DOMAIN = "hydropolis_valbonne"
 
 CONF_CONTRAT_ID = "contrat_id"
+CONF_COMPTEUR_NUMSERIE = "compteur_numserie"
 
 DATA_REFRESH_INTERVAL = timedelta(hours=12)
 

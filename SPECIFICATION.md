@@ -82,7 +82,19 @@ not in the body:
 
 All three must be captured and forwarded to subsequent Omega API calls.
 
-**Failure:** HTTP status != 201 (typically 401).
+**Failure:** the SSO answers **HTTP 409** (not 401) with a JSON:API error body
+when it rejects the login/password pair:
+
+| Code       | Meaning                          |
+|------------|----------------------------------|
+| `10300002` | `Le mot de passe est incorrect !`|
+| `10300004` | `Le login <email> n'existe pas !`|
+
+Any other non-201 status (500, 502, 429, ...) is a **transient** backend
+failure, not a credentials problem. The SSO is observed to answer 500 to
+perfectly valid credentials when logins are issued in quick succession, and it
+recovers on its own. Only 400/401/403/409/422 may be reported as invalid
+credentials — see §6.10.
 
 ### 2.2 Omega Main API
 
@@ -305,7 +317,7 @@ flowchart TD
 custom_components/hydropolis_valbonne/
 ├── __init__.py          # Entry point: setup/unload config entries
 ├── api.py               # HydropolisClient: all API interaction
-├── config_flow.py       # Two-step config flow (credentials + contract)
+├── config_flow.py       # Config flow: setup, reauth and reconfigure
 ├── const.py             # Constants: DOMAIN, URLs, API IDs, intervals
 ├── coordinator.py       # DataUpdateCoordinator + statistics import
 ├── sensor.py            # Sensor entity with RestoreEntity
@@ -330,7 +342,7 @@ custom_components/hydropolis_valbonne/
 
 ### 5.4 Config Flow (`config_flow.py`)
 
-Two-step flow:
+Two-step setup flow:
 
 1. **`async_step_user`** -- Collects `username` (email) and `password`.
    Authenticates via `HydropolisClient.authenticate()` and fetches contracts.
@@ -351,6 +363,23 @@ The config entry stores:
 
 `unique_id` is set to `contrat_id` so duplicates are detected via
 `_abort_if_unique_id_configured()`.
+
+**Credential repair steps:**
+
+3. **`async_step_reauth` / `async_step_reauth_confirm`** -- started by HA when
+   the coordinator raises `ConfigEntryAuthFailed`. Prefills the stored email
+   and asks for the credentials again.
+4. **`async_step_reconfigure`** -- the same form, reachable at any time from
+   the entry's menu, so the credentials can be reviewed and changed without
+   deleting the entry.
+
+Both share `_async_credentials_step()`, which re-authenticates, checks that the
+account still owns the entry's `contrat_id` (error `contract_not_found`
+otherwise), then updates the entry via `async_update_reload_and_abort()`. The
+contract is deliberately *not* selectable there: `contrat_id` is the entry's
+unique ID and the key of the imported statistics, so changing it would orphan
+the recorded history. Sibling entries of the same account are updated and
+reloaded too — see §6.11.
 
 **Pitfall:** `AbortFlow` (raised by `_abort_if_unique_id_configured`) must be
 explicitly caught and re-raised before any generic `except Exception` block,
@@ -457,7 +486,10 @@ async def async_setup_entry(hass, entry):
 
 The coordinator's `_async_setup` (called automatically by
 `async_config_entry_first_refresh`) creates the `HydropolisClient` and
-authenticates. If credentials are invalid, `ConfigEntryError` is raised.
+authenticates. Rejected credentials raise `ConfigEntryAuthFailed` (which makes
+HA start a reauth flow); a transient backend failure raises
+`ConfigEntryNotReady` so HA retries with backoff. Neither may be
+`ConfigEntryError`, which fails the entry permanently — see §6.10.
 
 ### 5.8 Manifest (`manifest.json`)
 
@@ -567,6 +599,37 @@ The 3Int API uses plain `application/json`.
 
 ---
 
+### 6.10 Transient Failures Must Never Look Like Bad Credentials
+
+`authenticate()` returns `False` only for the statuses listed in
+`CREDENTIAL_REJECTED_STATUSES` (400/401/403/409/422) and raises
+`HydropolisApiError` for everything else. The coordinator maps the two cases to
+different HA exceptions:
+
+| Condition                        | Exception               | HA behaviour                |
+|----------------------------------|-------------------------|-----------------------------|
+| Credentials rejected (409, ...)  | `ConfigEntryAuthFailed` | Starts a reauth flow         |
+| 5xx / 429 / network failure      | `ConfigEntryNotReady`   | Retries the setup with backoff |
+
+Reporting a 500 as invalid credentials leaves the integration permanently
+broken until Home Assistant is restarted, which is exactly what a flaky
+Hydropolis backend used to cause.
+
+The message returned by the SSO is kept in `HydropolisClient.last_auth_error`
+and used as the `ConfigEntryAuthFailed` message so the log names the real
+reason.
+
+### 6.11 Credential Changes and the Shared Client
+
+Entries of the same account share one `HydropolisClient` (see the multi-contract design in §5).
+After a reauth/reconfigure, the cached client still holds the old password, so:
+
+- `HydropolisCoordinator._async_setup` calls `client.credentials_match()` and
+  drops the cached client when the entry's credentials changed;
+- the config flow updates **and reloads every sibling entry** of the same
+  account, otherwise untouched entries keep authenticating with the old
+  password.
+
 ## 7. Energy Dashboard Integration
 
 ### How It Works
@@ -646,6 +709,10 @@ from the statistics table.
 - Single contract creates entry directly
 - Multiple contracts shows select step, then creates entry
 - Duplicate contract aborts
+- Reauth flow updates the stored credentials in place
+- Reauth flow rejects wrong credentials and an account lacking the contract
+- Reauth propagates the new credentials to sibling entries of the same account
+- Reconfigure flow updates credentials while keeping the contract
 
 **`test_coordinator.py`** -- Coordinator tests:
 - First refresh fetches full history
@@ -654,6 +721,11 @@ from the statistics table.
 - API error sets `last_update_success = False`
 - Statistic ID uses external format (`domain:identifier`)
 - Incremental refresh works with new data
+- A transient API error retries the setup instead of failing the entry
+- Rejected credentials fail the entry and start a reauth flow
+- A failed authentication is not cached in the shared-client registry
+- A changed password replaces the cached shared client
+- An auth error during a refresh starts a reauth flow
 
 **`test_sensor.py`** -- Sensor entity tests:
 - State value matches latest `meter_index`
@@ -803,12 +875,18 @@ pytest tests/test_api.py -v
 
 ### `strings.json` / `translations/en.json`
 
-Both files have identical content:
+`strings.json` and `translations/en.json` have identical content:
 
-- **Config steps:** `user` (login form), `select_contract` (contract picker)
-- **Errors:** `invalid_auth`, `cannot_connect`, `no_contracts`, `unknown`
-- **Abort reasons:** `already_configured`
+- **Config steps:** `user` (login form), `select_contract` (contract picker),
+  `reauth_confirm` (credentials repair), `reconfigure` (credentials review)
+- **Errors:** `invalid_auth`, `cannot_connect`, `no_contracts`,
+  `contract_not_found`, `unknown`
+- **Abort reasons:** `already_configured`, `reauth_successful`,
+  `reconfigure_successful`
 - **Entity names:** `sensor.water_meter` -> "Water meter"
+
+A French translation (`translations/fr.json`) is shipped alongside, the
+integration being Valbonne-specific.
 
 ---
 

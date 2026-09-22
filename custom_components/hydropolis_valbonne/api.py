@@ -22,6 +22,14 @@ _LOGGER = logging.getLogger(__name__)
 
 JSONAPI_CONTENT_TYPE = "application/vnd.api+json"
 
+# Statuses for which the SSO is telling us the login/password pair is wrong.
+# The JVS Omega SSO answers 409 with a JSON:API error body — 10300002 for a
+# wrong password, 10300004 for an unknown login — and not the more usual 401.
+# Anything else (5xx, 429, ...) is transient and must not be reported as
+# "invalid credentials", otherwise the integration fails permanently on a
+# simple server-side hiccup.
+CREDENTIAL_REJECTED_STATUSES = frozenset({400, 401, 403, 409, 422})
+
 
 class HydropolisAuthError(Exception):
     """Raised when authentication fails."""
@@ -76,6 +84,10 @@ class HydropolisClient:
         self._username = username
         self._password = password
 
+        # Human-readable reason of the last credential rejection, straight from
+        # the SSO ("Le mot de passe est incorrect !", ...).
+        self.last_auth_error: str | None = None
+
         self._omega_token: str | None = None
         self._omega_sso_id: str | None = None
         self._omega_app_id: str | None = None
@@ -84,8 +96,23 @@ class HydropolisClient:
         self._3int_tokens: dict[str, str] = {}
         self._data_available_since: dict[str, date] = {}
 
+    def credentials_match(self, username: str, password: str) -> bool:
+        """Whether this client still holds the given credentials.
+
+        Used by the coordinator to detect that a config entry was re-authed
+        with a new password and that the cached shared client is stale.
+        """
+        return self._username == username and self._password == password
+
     async def authenticate(self) -> bool:
-        """Authenticate against the Omega SSO and return True on success."""
+        """Authenticate against the Omega SSO.
+
+        Returns True on success and False only when the server explicitly
+        rejected the credentials.  Any other failure (server error, rate
+        limiting, maintenance) raises HydropolisApiError so callers can treat
+        it as a transient condition and retry instead of declaring the
+        credentials invalid.
+        """
         self._omega_token = None
         try:
             resp = await self._session.post(
@@ -99,9 +126,20 @@ class HydropolisClient:
         except aiohttp.ClientError as err:
             raise HydropolisApiError(f"Connection error during login: {err}") from err
 
-        if resp.status != 201:
-            _LOGGER.debug("SSO login returned status %s", resp.status)
+        if resp.status in CREDENTIAL_REJECTED_STATUSES:
+            self.last_auth_error = await self._error_detail(resp)
+            _LOGGER.warning(
+                "Hydropolis rejected the credentials of %s (HTTP %s): %s",
+                self._username,
+                resp.status,
+                self.last_auth_error or "no detail given",
+            )
             return False
+
+        if resp.status != 201:
+            raise HydropolisApiError(f"SSO login returned {resp.status}")
+
+        self.last_auth_error = None
 
         self._omega_token = resp.headers.get("authorization")
         self._omega_sso_id = resp.headers.get("ssoid")
@@ -116,6 +154,25 @@ class HydropolisClient:
         self._3int_tokens.clear()
 
         return True
+
+    @staticmethod
+    async def _error_detail(resp: aiohttp.ClientResponse) -> str | None:
+        """Extract the message of a JSON:API error response, if any."""
+        try:
+            body = await resp.json(content_type=None)
+        except (aiohttp.ClientError, ValueError):
+            return None
+
+        if not isinstance(body, dict):
+            return None
+        errors = body.get("errors")
+        if not isinstance(errors, list) or not errors:
+            return None
+        first = errors[0]
+        if not isinstance(first, dict):
+            return None
+        detail = first.get("detail") or first.get("title")
+        return str(detail) if detail else None
 
     def _omega_headers(self) -> dict[str, str]:
         """Build headers for Omega API calls."""
@@ -219,6 +276,11 @@ class HydropolisClient:
         except aiohttp.ClientError as err:
             raise HydropolisApiError(f"3Int auth error: {err}") from err
 
+        if resp.status in (401, 403):
+            raise HydropolisAuthError(
+                f"3Int auth rejected the Omega session (status {resp.status})"
+            )
+
         if resp.status != 200:
             raise HydropolisApiError(f"3Int auth returned {resp.status}")
 
@@ -241,6 +303,26 @@ class HydropolisClient:
         except (IndexError, ValueError, TypeError):
             _LOGGER.debug("Could not parse datedeb from 3Int JWT for contrat %s", contrat_id)
 
+    async def _ensure_3int_token(self, contrat_id: str, serial: str) -> None:
+        """Obtain a 3Int token, refreshing the Omega session if it was refused.
+
+        A 401 from the token exchange means the Omega session behind it went
+        stale, not that the account credentials are wrong — so log in again and
+        retry once before giving up.
+        """
+        try:
+            await self._authenticate_3int(contrat_id, serial)
+        except HydropolisAuthError:
+            _LOGGER.debug(
+                "3Int refused the Omega session for contrat %s, re-authenticating",
+                contrat_id,
+            )
+            if not await self.authenticate():
+                raise HydropolisAuthError(
+                    self.last_auth_error or "Failed to re-authenticate with Omega SSO"
+                ) from None
+            await self._authenticate_3int(contrat_id, serial)
+
     async def get_daily_measures(
         self,
         contrat_id: str,
@@ -256,10 +338,12 @@ class HydropolisClient:
         """
         if not self._omega_token:
             if not await self.authenticate():
-                raise HydropolisAuthError("Failed to authenticate with Omega SSO")
+                raise HydropolisAuthError(
+                    self.last_auth_error or "Failed to authenticate with Omega SSO"
+                )
 
         if contrat_id not in self._3int_tokens:
-            await self._authenticate_3int(contrat_id, serial)
+            await self._ensure_3int_token(contrat_id, serial)
 
         start_str = start.strftime("%Y-%m-%d") + "T00:00:00"
         end_str = end.strftime("%Y-%m-%d") + "T23:59:59"
@@ -296,8 +380,11 @@ class HydropolisClient:
                 self._3int_tokens.pop(contrat_id, None)
                 if not self._omega_token:
                     if not await self.authenticate():
-                        raise HydropolisAuthError("Failed to re-authenticate with Omega SSO")
-                await self._authenticate_3int(contrat_id, serial)
+                        raise HydropolisAuthError(
+                            self.last_auth_error
+                            or "Failed to re-authenticate with Omega SSO"
+                        )
+                await self._ensure_3int_token(contrat_id, serial)
                 # Retry once with the fresh token
                 headers["Authorization"] = f"Bearer {self._3int_tokens[contrat_id]}"
                 try:

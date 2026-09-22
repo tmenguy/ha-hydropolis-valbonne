@@ -18,14 +18,19 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, UnitOfVolume
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryError
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 import homeassistant.util.dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .api import DailyMeasure, HydropolisApiError, HydropolisAuthError, HydropolisClient
-from .const import CONF_CONTRAT_ID, DATA_REFRESH_INTERVAL, DOMAIN
+from .const import (
+    CONF_COMPTEUR_NUMSERIE,
+    CONF_CONTRAT_ID,
+    DATA_REFRESH_INTERVAL,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,7 +85,7 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             config_entry=config_entry,
         )
         self._contrat_id: str = config_entry.data[CONF_CONTRAT_ID]
-        self._serial: str = config_entry.data["compteur_numserie"]
+        self._serial: str = config_entry.data[CONF_COMPTEUR_NUMSERIE]
 
     @property
     def statistic_id(self) -> str:
@@ -102,17 +107,50 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
         )
 
         async with lock:
-            if username not in shared_clients:
+            self._prune_shared_clients(shared_clients)
+
+            client = shared_clients.get(username)
+            if client is not None and not client.credentials_match(username, password):
+                # The entry was re-authenticated with a new password: the cached
+                # client still holds the old one, so drop it.
+                _LOGGER.debug("Credentials changed for user %s, dropping cached client", username)
+                shared_clients.pop(username, None)
+                client = None
+
+            if client is None:
                 _LOGGER.debug("Creating new shared HydropolisClient for user %s", username)
                 session = async_get_clientsession(self.hass)
                 client = HydropolisClient(session, username, password)
-                if not await client.authenticate():
-                    raise ConfigEntryError("Invalid credentials for Hydropolis")
+                try:
+                    authenticated = await client.authenticate()
+                except HydropolisApiError as err:
+                    # Server-side / network problem: retry later instead of
+                    # failing the entry permanently.
+                    raise ConfigEntryNotReady(
+                        f"Unable to reach Hydropolis: {err}"
+                    ) from err
+                if not authenticated:
+                    # Raising ConfigEntryAuthFailed (and not ConfigEntryError)
+                    # makes HA start a reauth flow so the user can fix the
+                    # credentials from the UI.
+                    raise ConfigEntryAuthFailed(
+                        client.last_auth_error or "Invalid credentials for Hydropolis"
+                    )
                 shared_clients[username] = client
             else:
                 _LOGGER.debug("Reusing existing shared HydropolisClient for user %s", username)
 
-            self._client = shared_clients[username]
+            self._client = client
+
+    def _prune_shared_clients(self, shared_clients: dict[str, HydropolisClient]) -> None:
+        """Forget shared clients whose account is no longer used by any entry."""
+        in_use = {
+            entry.data.get(CONF_USERNAME)
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+        }
+        for stale in set(shared_clients) - in_use:
+            _LOGGER.debug("Dropping unused shared HydropolisClient for user %s", stale)
+            shared_clients.pop(stale, None)
 
     async def _async_update_data(self) -> HydropolisData | None:
         """Incremental fetch: get data from last known stat to today.
@@ -144,7 +182,13 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
             measures = await self._client.get_daily_measures(
                 self._contrat_id, self._serial, start, today
             )
-        except (HydropolisApiError, HydropolisAuthError) as err:
+        except HydropolisAuthError as err:
+            # Credentials or session no longer accepted: ask HA for a reauth
+            # flow rather than silently retrying forever.
+            raise ConfigEntryAuthFailed(
+                f"Hydropolis rejected the credentials: {err}"
+            ) from err
+        except HydropolisApiError as err:
             raise UpdateFailed(f"Error fetching Hydropolis data: {err}") from err
 
         if not measures:
