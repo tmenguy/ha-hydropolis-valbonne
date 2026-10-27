@@ -49,6 +49,10 @@ class HydropolisData:
 
     meter_total_liters: int
     last_measurement: datetime
+    # True when the value comes from the last recorded statistic because the
+    # remote API could not be reached: a meter index does not stop existing
+    # when the provider's platform is down, so we keep serving it and say so.
+    stale: bool = False
 
 
 type HydropolisConfigEntry = ConfigEntry[HydropolisCoordinator]
@@ -189,12 +193,35 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
                 f"Hydropolis rejected the credentials: {err}"
             ) from err
         except HydropolisApiError as err:
+            # The provider's platform is unreachable. A water meter index does
+            # not disappear because a remote API is down: fall back to the last
+            # recorded statistic and flag it as stale instead of making the
+            # entity unavailable and losing the reading from the dashboard.
+            if last_stat is not None:
+                _LOGGER.warning(
+                    "Hydropolis unreachable (%s) — serving last recorded statistic from %s",
+                    err,
+                    datetime.fromtimestamp(last_stat["start"]).isoformat(),
+                )
+                return HydropolisData(
+                    meter_total_liters=int(last_stat["sum"]),
+                    last_measurement=datetime.fromtimestamp(last_stat["start"]),
+                    stale=True,
+                )
             raise UpdateFailed(f"Error fetching Hydropolis data: {err}") from err
 
         if not measures:
             if self.data is not None:
-                _LOGGER.debug("No new measures, keeping previous reading")
-                return self.data
+                if not self.data.stale:
+                    _LOGGER.debug("No new measures, keeping previous reading")
+                    return self.data
+                # Coming back from a stale fallback: the API answered again,
+                # so the value must stop being flagged as stale.
+                return HydropolisData(
+                    meter_total_liters=self.data.meter_total_liters,
+                    last_measurement=self.data.last_measurement,
+                    stale=False,
+                )
             if last_stat is not None:
                 _LOGGER.info(
                     "No new measures from API; restoring from last recorded statistic"
@@ -202,6 +229,7 @@ class HydropolisCoordinator(DataUpdateCoordinator[HydropolisData]):
                 return HydropolisData(
                     meter_total_liters=int(last_stat["sum"]),
                     last_measurement=datetime.fromtimestamp(last_stat["start"]),
+                    stale=False,
                 )
             _LOGGER.info("No measures available from Hydropolis API yet")
             return None

@@ -119,13 +119,25 @@ class HydropolisWaterMeterSensor(
         return None
 
     @property
+    def available(self) -> bool:
+        """Stay available as long as a reading is known.
+
+        A water meter index does not vanish because the provider's API is
+        unreachable; reporting `unavailable` silently removes the entity from
+        the Energy dashboard. The `stale` attribute tells the difference.
+        """
+        return self.native_value is not None
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self.coordinator.data is not None:
             return {
                 "last_measurement": self.coordinator.data.last_measurement.isoformat(),
+                "stale": self.coordinator.data.stale,
             }
         if self._restored_data is not None and self._restored_data.last_measurement:
             return {
                 "last_measurement": self._restored_data.last_measurement,
+                "stale": True,
             }
         return None

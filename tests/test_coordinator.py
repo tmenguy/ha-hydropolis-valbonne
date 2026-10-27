@@ -109,11 +109,17 @@ async def test_api_error_raises_update_failed(
     mock_config_entry,
     mock_hydropolis_client,
 ):
+    """Without any recorded statistic, an API error is a real failure.
+
+    When a reading is on record the coordinator serves it as stale instead;
+    this test pins the other side of that contract.
+    """
     coordinator = await _setup(hass, mock_config_entry)
 
     mock_hydropolis_client.get_daily_measures = AsyncMock(
         side_effect=HydropolisApiError("server down")
     )
+    coordinator._get_last_stat = AsyncMock(return_value=None)
     await coordinator.async_refresh()
     await hass.async_block_till_done()
 
@@ -347,3 +353,60 @@ async def test_auth_error_during_refresh_starts_reauth_flow(
     assert coordinator.last_update_success is False
     flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
     assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+
+
+async def test_api_error_serves_last_statistic_as_stale(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """A backend outage must not blank the meter when a reading is known.
+
+    A water meter index does not stop existing because the provider's platform
+    is unreachable: the coordinator falls back to the last recorded statistic,
+    flags it stale, and keeps the entity available instead of dropping it from
+    the Energy dashboard.
+    """
+    coordinator = await _setup(hass, mock_config_entry)
+
+    mock_hydropolis_client.get_daily_measures = AsyncMock(
+        side_effect=HydropolisApiError("server down")
+    )
+    coordinator._get_last_stat = AsyncMock(
+        return_value={"start": 1_760_000_000, "state": 123456.0, "sum": 123456.0}
+    )
+
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success is True
+    assert coordinator.data is not None
+    assert coordinator.data.stale is True
+    assert coordinator.data.meter_total_liters == 123456
+
+
+async def test_stale_flag_clears_when_api_answers_again(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_hydropolis_client,
+):
+    """Once the API answers, the reading stops being stale."""
+    coordinator = await _setup(hass, mock_config_entry)
+
+    mock_hydropolis_client.get_daily_measures = AsyncMock(
+        side_effect=HydropolisApiError("server down")
+    )
+    coordinator._get_last_stat = AsyncMock(
+        return_value={"start": 1_760_000_000, "state": 123456.0, "sum": 123456.0}
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.stale is True
+
+    mock_hydropolis_client.get_daily_measures = AsyncMock(return_value=[])
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.data is not None
+    assert coordinator.data.stale is False
+    assert coordinator.data.meter_total_liters == 123456
